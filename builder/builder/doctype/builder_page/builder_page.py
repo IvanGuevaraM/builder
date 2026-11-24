@@ -359,6 +359,8 @@ class BuilderPage(WebsiteGenerator):
 		for session in frappe.get_all("Builder AI Session", filters={"page": self.name}, pluck="name"):
 			# another user's chat on this page goes too, whoever deletes the page
 			frappe.delete_doc("Builder AI Session", session, ignore_missing=True, ignore_permissions=True)
+		# a chat that went on elsewhere keeps its messages and just stops listing this page
+		frappe.db.delete("Builder AI Session Page", {"page": self.name})
 
 		if self.is_template and self.template_group:
 			if frappe.conf.developer_mode:
@@ -1058,8 +1060,9 @@ def get_dynamic_props_template(
 	"""Get a Jinja template reference for dynamic properties."""
 	# props tell a missing path apart from an empty object, so the chain ends in none
 	key = get_binding_key(prop_value, comes_from, data_key, missing="none")
-	fallback = escape_single_quotes(default_value) if default_value is not None else "undefined"
-	return f"{{{{ {key} if {key} is defined and {key} is not none else '{fallback}' }}}}"
+	# a number, boolean or object default is a literal of its own type, not a quoted string
+	fallback = to_jinja_literal(default_value) if default_value is not None else "'undefined'"
+	return f"{{{{ {key} if {key} is defined and {key} is not none else {fallback} }}}}"
 
 
 # Reserved characters and existing %-escapes pass through, so absolute and data: URLs

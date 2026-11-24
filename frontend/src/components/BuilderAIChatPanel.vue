@@ -1,10 +1,10 @@
 <template>
 	<div class="flex h-full min-h-full flex-col bg-surface-base">
-		<div class="flex items-center justify-between border-b border-outline-gray-1 px-3 py-2.5">
+		<!-- fixed height, so a title arriving later doesn't push the chat down -->
+		<div class="flex h-14 shrink-0 items-center justify-between border-b border-outline-gray-1 px-3">
 			<div class="flex min-w-0 flex-col gap-1">
-				<div class="mt-1 text-sm font-semibold text-ink-gray-9">Bob AI</div>
-				<!-- min-h holds the row while the title is still blank -->
-				<div class="min-h-4 truncate text-p-xs leading-4 text-ink-gray-5">
+				<div class="text-sm font-semibold text-ink-gray-9">Bob AI</div>
+				<div v-if="isSubmitting || currentSessionTitle" class="truncate text-p-xs leading-4 text-ink-gray-5">
 					{{ isSubmitting ? currentActivity : currentSessionTitle }}
 				</div>
 			</div>
@@ -54,7 +54,12 @@
 		</div>
 
 		<template v-else>
-			<div ref="messageContainer" class="no-scrollbar flex-1 space-y-4 overflow-y-auto px-4 py-4">
+			<!-- overflow-wrap is inherited, so this reaches every message and card. `anywhere`, not
+			     break-words: break-words keeps a flex item as wide as its longest word, so a
+			     pasted URL ran off the panel. -->
+			<div
+				ref="messageContainer"
+				class="no-scrollbar flex-1 space-y-4 overflow-y-auto px-4 py-4 [overflow-wrap:anywhere]">
 				<div v-if="!messages.length" class="flex h-full flex-col items-center justify-center gap-5 px-4 pb-8">
 					<div class="flex flex-col items-center gap-2.5">
 						<span class="bob-hero-orb">
@@ -93,7 +98,17 @@
 						">
 						<!-- ui-card messages persist the full card as text (for model replay);
 						     the bubble shows only the short lead-in — the card renders the rest -->
-						<template v-if="message.role === 'assistant'">
+						<AIPageBuild
+							v-if="message.role === 'assistant' && message.metadata?.buildPage"
+							:page="message.metadata.buildPage"
+							:steps="message.metadata.steps || []"
+							:text="message.metadata?.status === 'running' ? '' : message.content"
+							:running="turnRunning(message)"
+							:elapsed-ms="message.metadata.debug?.elapsedMs"
+							:debug="!!message.metadata.debug"
+							@open="chat.openPage"
+							@inspect="openDebug(message.metadata.debug)" />
+						<template v-else-if="message.role === 'assistant'">
 							<!-- What Bob thought, ran and said on the way to this answer. Steps
 							     carry their own running state; the row below covers the stretches
 							     where no step is on the clock. -->
@@ -104,7 +119,7 @@
 								class="mb-2" />
 							<div
 								v-if="assistantText(message)"
-								class="ai-prose prose prose-sm max-w-none break-words text-p-sm"
+								class="ai-prose prose prose-sm max-w-none text-p-sm"
 								v-html="renderMarkdown(assistantText(message))" />
 							<div v-if="cardPlugins(message).length" class="mt-2 flex flex-col gap-2">
 								<AIPluginCard v-for="plugin in cardPlugins(message)" :key="plugin" :plugin="plugin" />
@@ -128,16 +143,29 @@
 						<div v-else>
 							<!-- Card-composed replies relay a long labelled text to the model;
 							     the chat shows only the compact display line. -->
-							<div class="whitespace-pre-wrap break-words">
-								{{ message.metadata?.displayText || message.content }}
+							<div class="whitespace-pre-wrap">
+								<template
+									v-for="(part, i) in linkParts(message.metadata?.displayText || message.content)"
+									:key="i">
+									<a
+										v-if="part.href"
+										:href="part.href"
+										target="_blank"
+										rel="noopener noreferrer"
+										class="ai-link">
+										{{ part.text }}
+									</a>
+									<template v-else>{{ part.text }}</template>
+								</template>
 							</div>
 						</div>
 						<div
 							v-if="
-								message.metadata?.affectedBlocks?.length ||
-								message.metadata?.affectedScripts?.length ||
-								message.metadata?.revertSnapshot ||
-								message.metadata?.debug
+								!message.metadata?.buildPage &&
+								(message.metadata?.affectedBlocks?.length ||
+									message.metadata?.affectedScripts?.length ||
+									message.metadata?.revertSnapshot ||
+									message.metadata?.debug)
 							"
 							class="mb-2 mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-ink-gray-4">
 							<AIAffectedItems
@@ -147,7 +175,7 @@
 								@select-block="selectBlockById"
 								@open-script="openScriptByName" />
 
-							<Tooltip v-if="message.metadata?.revertSnapshot" text="Revert the page to before this AI edit">
+							<Tooltip v-if="canRevert(message)" text="Revert the page to before this AI edit">
 								<button
 									class="inline-flex items-center gap-1 transition-colors hover:text-ink-gray-7 disabled:cursor-not-allowed disabled:opacity-40"
 									:disabled="isSubmitting || !isEditingPage"
@@ -177,29 +205,40 @@
 								</div>
 							</template>
 						</div>
-						<!-- Sensitive action — needs the user's OK. Calm neutral surface with a
-						     small amber eyebrow: the QUESTION is the content, and it appears once
-						     (the model-facing summary text is suppressed above), so the card
-						     reads as a decision, not an alarm. -->
+						<!-- Bob's changes to other pages: asks per page, then shows how each went -->
+						<AIPageCard
+							v-if="message.metadata?.kind === 'page_changes'"
+							:metadata="message.metadata"
+							:interactive="message.id === lastMessageId"
+							:builds="builds"
+							:busy="isSubmitting"
+							:confirming="confirmingAction"
+							class="mt-2"
+							@apply="(skip) => confirmPendingAction(message, 'apply', skip)"
+							@skip="confirmPendingAction(message, 'skip')"
+							@open="chat.openPage" />
+						<!-- A sensitive action waits for the user's OK. The question is the whole
+						     card (the model-facing summary is suppressed above), so it reads as a
+						     decision, not an alarm. -->
 						<div
-							v-if="message.metadata?.status === 'pending_action'"
+							v-else-if="message.metadata?.status === 'pending_action'"
 							class="mt-2 w-full rounded-6 border border-outline-gray-2 bg-surface-gray-1 p-3">
-							<p class="text-p-xs font-medium text-ink-amber-8">Needs your OK</p>
-							<p class="mt-1 text-p-sm leading-snug text-ink-gray-8">
+							<p class="text-p-sm font-medium text-ink-gray-8">
 								{{ pendingPreview(message.metadata) }}
 							</p>
-							<div v-if="message.id === lastMessageId" class="mt-3 flex gap-2">
+							<div v-if="message.id === lastMessageId" class="mt-2.5 flex gap-2">
 								<Button
 									variant="solid"
 									size="sm"
 									:loading="confirmingAction"
+									:disabled="isSubmitting"
 									@click="confirmPendingAction(message, 'apply')">
-									{{ applyLabel(message.metadata?.kind) }}
+									{{ applyLabel(message.metadata) }}
 								</Button>
 								<Button
 									variant="subtle"
 									size="sm"
-									:disabled="confirmingAction"
+									:disabled="confirmingAction || isSubmitting"
 									@click="confirmPendingAction(message, 'skip')">
 									Skip
 								</Button>
@@ -214,20 +253,43 @@
 							:answered-with="replyTo(message)"
 							:lead="message.metadata.text"
 							@submit="selectOption" />
+						<!-- What Bob could do next: tapping one sends it. Plain buttons like the chips
+						     below, since a frappe-ui Button truncates its label to one line. -->
+						<div v-if="nextSteps(message).length" class="mt-2 flex flex-wrap gap-1.5">
+							<button
+								v-for="(step, i) in nextSteps(message)"
+								:key="step"
+								class="bob-pill-in max-w-full rounded-3 bg-surface-gray-2 px-1.5 py-1 text-left text-xs leading-snug text-ink-gray-8 transition-colors hover:bg-surface-gray-3 disabled:cursor-not-allowed disabled:opacity-50"
+								:style="{ animationDelay: `${i * 70}ms` }"
+								:disabled="!isEditingPage"
+								@click="selectOption(step)">
+								{{ step }}
+							</button>
+						</div>
 					</div>
-					<!-- Block + image chips below the bubble -->
+					<!-- Page, block and attachment chips below the bubble -->
 					<div
 						v-if="
 							message.role === 'user' &&
-							(message.metadata?.selectedBlockContext?.length || message.metadata?.attachedImageUrl)
+							(sentFrom(message) ||
+								message.metadata?.selectedBlockContext?.length ||
+								sentAttachmentChips(message.metadata).length)
 						"
 						class="mt-1 flex max-w-[88%] flex-wrap items-center gap-1">
-						<!-- image chip -->
+						<!-- sent from another page: the chat went on from there -->
+						<button
+							v-if="sentFrom(message)"
+							class="inline-flex items-center gap-1 rounded-4 bg-surface-gray-2 px-1.5 py-0.5 text-[10px] text-ink-gray-6 transition-colors hover:bg-surface-gray-3 hover:text-ink-gray-8"
+							@click="chat.openPage(sentFrom(message)!.page_id)">
+							<span class="lucide-file size-2.5" />
+							{{ sentFrom(message)!.title }}
+						</button>
 						<span
-							v-if="message.metadata?.attachedImageUrl"
+							v-for="chip in sentAttachmentChips(message.metadata)"
+							:key="chip.key"
 							class="inline-flex items-center gap-1 rounded-4 bg-surface-gray-2 px-1.5 py-0.5 text-[10px] text-ink-gray-6">
-							<img :src="message.metadata.attachedImageUrl" class="h-3 w-3 rounded-4 object-cover" alt="" />
-							Image
+							<img :src="chip.thumb" class="h-3 w-3 rounded-4 object-cover" alt="" />
+							{{ chip.kind === "video" ? "Video" : "Image" }}
 						</span>
 						<!-- block chips -->
 						<button
@@ -289,16 +351,20 @@
 				</button>
 			</div>
 			<Transition name="fade">
-				<div v-if="imagePreviewUrl" class="mb-1.5 flex flex-wrap gap-1">
+				<div v-if="attachedItems.length" class="mb-1.5 flex flex-wrap gap-1">
 					<span
+						v-for="item in attachedItems"
+						:key="item.id"
 						class="inline-flex items-center gap-1 rounded-4 bg-surface-gray-2 px-1.5 py-0.5 text-xs text-ink-gray-7">
-						<img :src="imagePreviewUrl" class="h-3 w-3 rounded-4 object-cover" alt="" />
-						<span class="max-w-[120px] truncate">{{ imageFileName }}</span>
-						<Tooltip text="Remove image">
+						<span v-if="!item.images.length" class="lucide-loader-circle h-3 w-3 animate-spin" />
+						<img v-else :src="item.images[0].data" class="h-3 w-3 rounded-4 object-cover" alt="" />
+						<span v-if="item.kind === 'video'" class="lucide-film h-3 w-3 text-ink-gray-5" />
+						<span class="max-w-[120px] truncate">{{ item.name }}</span>
+						<Tooltip :text="item.kind === 'video' ? 'Remove video' : 'Remove image'">
 							<button
 								type="button"
 								class="ml-0.5 flex items-center text-ink-gray-4 hover:text-ink-red-7"
-								@click="clearImage">
+								@click="chat.attachments.remove(item.id)">
 								<span class="lucide-x h-3 w-3" />
 							</button>
 						</Tooltip>
@@ -349,6 +415,7 @@
 			</div>
 			<!-- one box: the field on top, its controls along the bottom edge -->
 			<div
+				ref="composer"
 				class="relative rounded-6 border border-outline-gray-2 bg-surface-base transition-colors focus-within:border-outline-gray-4 focus-within:shadow-sm hover:border-outline-gray-3 hover:shadow-sm"
 				@paste.stop="handlePaste"
 				@dragover.prevent="isDragging = isVisionModel ? true : isDragging"
@@ -374,11 +441,17 @@
 					<Button
 						variant="ghost"
 						icon="lucide-plus"
-						label="Attach image"
-						:tooltip="isVisionModel ? 'Attach image' : `${modelLabel} can't read images`"
+						label="Attach images or a video"
+						:tooltip="isVisionModel ? 'Attach images or a video' : `${modelLabel} can't read images`"
 						:disabled="!isVisionModel || !isEditingPage"
 						@click="imageInput?.click()" />
-					<input ref="imageInput" type="file" accept="image/*" class="hidden" @change="pickImage" />
+					<input
+						ref="imageInput"
+						type="file"
+						accept="image/*,video/*"
+						multiple
+						class="hidden"
+						@change="pickFiles" />
 					<Button
 						variant="ghost"
 						size="xs"
@@ -403,10 +476,13 @@
 					<Button
 						v-if="isSubmitting"
 						variant="solid"
-						icon="lucide-square"
 						:loading="isCancelling"
 						:tooltip="isCancelling ? 'Cancelling…' : 'Cancel generation'"
-						@click="chat.cancel" />
+						@click="chat.cancel">
+						<template #icon>
+							<span class="block h-2 w-2 rounded-[1.5px] bg-current" />
+						</template>
+					</Button>
 					<Tooltip v-else side="top">
 						<template #content>
 							<span class="flex items-center gap-1.5">
@@ -424,7 +500,7 @@
 						class="pointer-events-none absolute inset-0 flex items-center justify-center rounded-6 border-2 border-dashed border-outline-blue-3 bg-surface-blue-1/60">
 						<div class="flex items-center gap-1.5 text-xs font-medium text-ink-blue-4">
 							<span class="lucide-image h-3.5 w-3.5" />
-							{{ __("Drop image to attach") }}
+							{{ __("Drop images or a video to attach") }}
 						</div>
 					</div>
 				</Transition>
@@ -440,10 +516,13 @@
 
 <script setup lang="ts">
 import AIAffectedItems from "@/components/AIAffectedItems.vue";
+import AIPageBuild from "@/components/ai/AIPageBuild.vue";
+import AIPageCard from "@/components/ai/AIPageCard.vue";
 import AIPluginCard from "@/components/ai/AIPluginCard.vue";
 import AICommandMenu from "@/components/ai/AICommandMenu.vue";
 import AIContextMeter from "@/components/ai/AIContextMeter.vue";
 import AITurnTimeline from "@/components/ai/AITurnTimeline.vue";
+import { sentAttachmentChips } from "@/components/ai/attachments";
 import { registerBobCommands } from "@/components/ai/bobCommands";
 import { useCommandMenu } from "@/components/ai/commandMenu";
 import { connectLevel } from "@/components/ai/commands/connect";
@@ -460,12 +539,15 @@ import AIDebugPanel from "@/components/AIDebugPanel.vue";
 import Dialog from "@/components/Controls/Dialog.vue";
 import SparklesIcon from "@/components/Icons/Sparkles.vue";
 import { cardAnswers } from "@/components/ai/cardAnswers";
-import { renderMarkdown } from "@/components/ai/markdown";
+import { linkParts, renderMarkdown } from "@/components/ai/markdown";
+import { pageBuilds } from "@/components/ai/pageChanges";
 import type { AITurnStep, ChatMessage } from "@/components/ai/types";
 import { reloadAIRegistry } from "@/data/aiModels";
+import { __ } from "@/translation";
 import useBuilderStore from "@/stores/builderStore";
 import useCanvasStore from "@/stores/canvasStore";
-import { Badge, Button, Dropdown, KeyboardShortcut, Textarea, Tooltip } from "frappe-ui";
+import { Badge, Button, Dropdown, KeyboardShortcut, Textarea, Tooltip, useKeyboardShortcut } from "frappe-ui";
+import { onClickOutside } from "@vueuse/core";
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 
 const chat = new AIChatController();
@@ -523,14 +605,14 @@ const sessionOptions = computed(() => {
 });
 const { selectBlockById, openScriptByName } = chat;
 const { attachedBlocks, attachableBlocks } = chat;
-const { imagePreviewUrl, imageFileName, isDragging, isVisionModel } = chat;
-const { clearImage, attachImageFile } = chat;
+const { isDragging, isVisionModel } = chat;
+const attachedItems = chat.attachments.items;
 
 const confirmingAction = ref(false);
-async function confirmPendingAction(message: ChatMessage, decision: "apply" | "skip") {
+async function confirmPendingAction(message: ChatMessage, decision: "apply" | "skip", skip: string[] = []) {
 	confirmingAction.value = true;
 	try {
-		await chat.confirmPendingAction(message, decision);
+		await chat.confirmPendingAction(message, decision, skip);
 	} finally {
 		confirmingAction.value = false;
 	}
@@ -576,11 +658,18 @@ const APPLY_LABELS: Record<string, string> = {
 	home_page: "Set home page",
 	global_settings: "Apply",
 };
-const applyLabel = (kind?: string) => APPLY_LABELS[kind || ""] || "Apply";
+const applyLabel = (m: Record<string, any> = {}) => APPLY_LABELS[m.kind || ""] || "Apply";
 const builderStore = useBuilderStore();
 const canvasStore = useCanvasStore();
 
 const lastMessageId = computed(() => messages.value.at(-1)?.id ?? null);
+const builds = computed(() => pageBuilds(messages.value));
+
+/** The next steps Bob suggested after its latest reply, while nothing is running. */
+function nextSteps(message: ChatMessage): string[] {
+	if (message.id !== lastMessageId.value || isSubmitting.value) return [];
+	return message.metadata?.suggestions ?? [];
+}
 
 /** The answer itself, without the timeline that led to it. A card message persists
  * its whole card as text so the model sees it on replay — the chat shows only the
@@ -588,7 +677,8 @@ const lastMessageId = computed(() => messages.value.at(-1)?.id ?? null);
  * the model-facing summary, and the card already asks the question in human terms;
  * rendering both put the same ask on screen twice, once in jargon. */
 function assistantText(message: ChatMessage): string {
-	if (message.metadata?.status === "pending_action") return "";
+	// a page card's text is for the model; its rows say it for the user
+	if (message.metadata?.status === "pending_action" || message.metadata?.kind === "page_changes") return "";
 	return message.metadata?.status === "ui" ? (message.metadata?.text ?? message.content) : message.content;
 }
 
@@ -602,6 +692,23 @@ function stillWorking(message: ChatMessage): boolean {
 	if (!isSubmitting.value || message.id !== lastMessageId.value) return false;
 	if (message.metadata?.status !== "running") return false;
 	return !(message.metadata.steps || []).some((step: AITurnStep) => step.status === "running");
+}
+
+/** This tab's turn, still running: a build line moves with it. */
+function turnRunning(message: ChatMessage): boolean {
+	return isSubmitting.value && message.id === lastMessageId.value && message.metadata?.status === "running";
+}
+
+/** A turn's snapshot restores onto its own page, and a chat goes on across pages. */
+function canRevert(message: ChatMessage): boolean {
+	const page = message.metadata?.pageId;
+	return !!message.metadata?.revertSnapshot && (!page || page === chat.pageId.value);
+}
+
+/** The page a message was sent from, when that's not the page open now. */
+function sentFrom(message: ChatMessage): { page_id: string; title: string } | null {
+	const page = message.metadata?.page;
+	return page?.page_id && page.page_id !== chat.pageId.value ? page : null;
 }
 
 /** The reply a card was answered with: the user message right after it. That
@@ -618,6 +725,8 @@ function replyTo(message: ChatMessage): string | undefined {
  * button, an unlabelled question) is left to speak for itself. */
 const visibleMessages = computed(() =>
 	messages.value.filter((message, i) => {
+		// the outcome of a page card, which the card itself shows
+		if (message.metadata?.card) return false;
 		if (message.role !== "user") return true;
 		const card = messages.value[i - 1]?.metadata;
 		if (card?.status !== "ui" || !card?.ui?.length) return true;
@@ -827,6 +936,17 @@ const bob: BobContext = {
 onUnmounted(registerBobCommands(bob));
 // runs the open level's cleanup, like a sign-in still polling
 onUnmounted(menu.close);
+// the menu sits inside the composer, and the prompt is its filter, so clicks there keep it open
+const composer = ref<HTMLElement | null>(null);
+onClickOutside(composer, menu.dismiss);
+// the composer stops its own Escape, so this only hears one pressed after focus left it
+useKeyboardShortcut({
+	combo: "Escape",
+	description: __("Close Bob's Menu"),
+	group: __("General"),
+	enabled: () => menuOpen.value && builderStore.leftPanelActiveTab === "Chat",
+	handler: (event) => menu.onKeydown(event),
+});
 
 const composerPlaceholder = computed(() => {
 	if (menuLevel.value && !menuLevel.value.input) return "Type to filter";
@@ -835,9 +955,11 @@ const composerPlaceholder = computed(() => {
 	return "Ask to create or edit this page, or type / for commands";
 });
 
-// a key or URL is typed into a field inside the menu; hand focus back after
+// a list filters on the prompt, and a field inside the menu hands focus back as it goes;
+// after a click away, focus stays wherever the click put it
 watch(menuLevel, (level) => {
-	if (!level?.input) nextTick(() => promptInput.value?.focus());
+	if (level?.input) return;
+	if (level || composer.value?.contains(document.activeElement)) nextTick(() => promptInput.value?.focus());
 });
 
 const submitPrompt = () => {
@@ -884,7 +1006,7 @@ const messageContainer = ref<HTMLElement | null>(null);
 watch(
 	messageContainer,
 	(el) => {
-		chat.messageContainer.value = el;
+		chat.scroll.container.value = el;
 	},
 	{ immediate: true },
 );
@@ -901,36 +1023,30 @@ useAIStatePoll(() => builderStore.leftPanelActiveTab === "Chat", builderStore);
 watch(
 	() => builderStore.leftPanelActiveTab,
 	(tab) => {
-		if (tab === "Chat") chat.flushPendingScroll();
+		if (tab === "Chat") chat.scroll.flushPending();
 	},
 );
 
 onUnmounted(() => chat.unmount());
 
 function handlePaste(event: ClipboardEvent) {
-	if (!isVisionModel.value) return;
-	const items = Array.from(event.clipboardData?.items || []);
-	const imageItem = items.find((item) => item.type.startsWith("image/"));
-	if (!imageItem) return;
+	const files = Array.from(event.clipboardData?.files || []);
+	if (!files.length) return;
 	event.preventDefault();
-	const file = imageItem.getAsFile();
-	if (file) attachImageFile(file);
+	chat.attachFiles(files);
 }
 
 const imageInput = ref<HTMLInputElement | null>(null);
 
-function pickImage(event: Event) {
+function pickFiles(event: Event) {
 	const input = event.target as HTMLInputElement;
-	const file = input.files?.[0];
-	if (file) attachImageFile(file);
+	chat.attachFiles(Array.from(input.files || []));
 	input.value = "";
 }
 
 function handleDrop(event: DragEvent) {
 	isDragging.value = false;
-	if (!isVisionModel.value) return;
-	const file = Array.from(event.dataTransfer?.files || []).find((f) => f.type.startsWith("image/"));
-	if (file) attachImageFile(file);
+	chat.attachFiles(Array.from(event.dataTransfer?.files || []));
 }
 
 const MAX_VISIBLE_CHIPS = 3;
@@ -968,6 +1084,21 @@ function toggleChips(messageId: string) {
 	--tw-prose-quote-borders: var(--outline-gray-2);
 	--tw-prose-th-borders: var(--outline-gray-2);
 	--tw-prose-td-borders: var(--outline-gray-1);
+}
+/* Links read as part of the text: a faint underline that firms up on hover. */
+.ai-link,
+.ai-prose a {
+	color: inherit;
+	font-weight: inherit;
+	text-decoration-line: underline;
+	text-decoration-color: var(--outline-gray-3);
+	text-underline-offset: 2px;
+	overflow-wrap: anywhere;
+	transition: text-decoration-color 0.15s;
+}
+.ai-link:hover,
+.ai-prose a:hover {
+	text-decoration-color: var(--ink-gray-5);
 }
 .ai-prose p:first-child {
 	margin-top: 0;

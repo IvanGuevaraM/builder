@@ -2,17 +2,23 @@
 
 Page-level settings (SEO/meta/lang/custom HTML) and theme variables are safe and
 reversible, so they are `side="server"` and apply immediately. Site-wide settings
-(global script/style/head/body HTML), the home page, and publishing affect every
-visitor and are hard to undo — those are `side="terminal"` and go through the
-confirm-gate (builder/ai/agent/pending.py); the user approves before they apply.
+(global script/style/head/body HTML) and the home page affect every visitor and
+are hard to undo, so they are `side="terminal"` and go through the confirm-gate
+(builder/ai/agent/pending.py); the user approves before they apply. Publishing
+applies immediately too: Bob publishes only when the user asks, and that ask is
+the approval.
 """
 
 import re
+from urllib.parse import urlparse
 
 import frappe
 
 from builder.ai.agent import pending
+from builder.ai.agent.page_changes import page_row
 from builder.ai.agent.registry import Tool
+from builder.ai.agent.tools.query import resolve_page_reference
+from builder.ai.stock_look import unseen_creams
 
 PAGE_SETTING_FIELDS = {
 	"page_title",
@@ -83,12 +89,22 @@ def emit_refetch(ctx, *resources: str) -> None:
 		# after_commit: the client re-READS these rows, so the emit must not outrun
 		# the round's commit (AgentRunner.checkpoint).
 		ctx.emit("refetch", resources=list(resources), after_commit=True)
+		if getattr(ctx, "off_screen", False):
+			ctx.emit_to_page("refetch", resources=list(resources), after_commit=True)
 
 
 def clean_variable_id(raw: str) -> str:
 	"""A Builder Token's doc name doubles as its CSS custom-property name, so it
 	must be a valid css ident: lowercase, [a-z0-9_-] only."""
 	return re.sub(r"[^a-z0-9_-]+", "-", (raw or "").strip().lower()).strip("-")
+
+
+STOCK_GROUND = (
+	"FAILED: {value} is a warm near-white, the ground of the stock generated look under any "
+	"name (cream, paper, chalk, sunwashed). Unless the user asked for it or their brand already "
+	"uses it, pick pure white, near-black or a colour you'd name, and set the token again. If "
+	"they did, set this same value again and it is saved."
+)
 
 
 def set_design_token(ctx, args: dict) -> str:
@@ -114,6 +130,8 @@ def set_design_token(ctx, args: dict) -> str:
 		value = value.split(",")[0].strip().strip("'\"")
 		if not value or value.startswith("var("):
 			return "FAILED: a Font token's value must be a bare font family name, e.g. 'Fraunces'."
+	if token_type == "Color" and unseen_creams(ctx, [value]):
+		return STOCK_GROUND.format(value=value)
 	fields = {
 		"type": token_type,
 		"value": value,
@@ -151,6 +169,56 @@ def set_design_token(ctx, args: dict) -> str:
 def request_set_home_page(ctx, args: dict) -> None:
 	route = (args.get("route") or "").strip()
 	pending.request_confirmation(ctx, "home_page", f"Set the site home page to '{route}'?", {"route": route})
+
+
+def publish_pages(ctx, args: dict) -> str:
+	staged = getattr(ctx, "page_changes", None)
+	held = {edit.page["page_id"] for edit in staged.staged()} if staged else set()
+	results = [publish_one(ref, held) for ref in args.get("pages") or [ctx.page_id or ""]]
+	if any(page_id == ctx.page_id for page_id, _ in results):
+		emit_refetch(ctx, "page")
+	return "\n".join(line for _, line in results)
+
+
+def publish_one(ref: str, held: set[str]) -> tuple[str | None, str]:
+	"""Publish one page as the editor's Publish button does. Returns the page id when
+	it went live, and a result line for the model."""
+	page_id, why = resolve_page_reference(ref)
+	if not page_id:
+		return None, f"FAILED: {why}."
+	if shared := pages_sharing(ref, page_id):
+		return None, f"NOT PUBLISHED: '{ref}' names more than one page ({shared}). Pass the page id."
+	page = page_row(page_id)
+	name = f"{page['title']} ({page['route']})"
+	if page_id in held:
+		return None, (
+			f"NOT PUBLISHED: {name} has changes waiting on the card at the end of this turn. "
+			"Tell the user to publish it once they apply them."
+		)
+	doc = frappe.get_doc("Builder Page", page_id)
+	if not doc.has_permission("write"):
+		return None, f"FAILED: this user can't publish {name}."
+	if doc.published and not doc.draft_blocks:
+		return None, f"ALREADY LIVE: {name} has no unpublished changes."
+	doc.publish()
+	return page_id, f"Published {name}."
+
+
+def pages_sharing(ref: str, page_id: str) -> str:
+	"""The pages a route or title names when it names several. A read can take the live
+	one; a publish can't guess, since a draft redesign often shares its route."""
+	if ref == page_id:
+		return ""
+	path = urlparse(ref).path if "://" in ref else ref
+	bare = path.strip().strip("/")
+	rows = frappe.get_all(
+		"Builder Page",
+		or_filters={"route": ["in", (bare, f"/{bare}")], "page_title": ref.strip()},
+		fields=["name", "page_title", "published"],
+	)
+	if len(rows) < 2:
+		return ""
+	return ", ".join(f"{r.name}: {r.page_title}, {'live' if r.published else 'draft'}" for r in rows)
 
 
 def request_edit_global_settings(ctx, args: dict) -> None:
@@ -238,6 +306,42 @@ set_home_page_tool = Tool(
 	handler=request_set_home_page,
 )
 
+publish_page_tool = Tool(
+	name="publish_page",
+	side="server",
+	description=(
+		"Publish pages, as the editor's Publish button does: each page's current draft goes live at its "
+		"route for every visitor. Only when the user asks to publish or go live, never on your own "
+		"after a build. Pages they name (this page, the pricing page) need no confirmation: their ask "
+		"is the approval. A broad ask ('publish everything', 'all pages') is a scope to check, not a "
+		"list, since a sweep also catches drafts nobody meant to ship. First find what it would change "
+		"(run_python: Builder Pages, not templates, that are unpublished or whose draft_blocks differs "
+		"from blocks, with their name, route and project_folder; a draft identical to the live blocks "
+		"is no change). If that's a few pages they'd expect, publish them. If it's many, or spread "
+		"across folders, ask one quick present_ui question first: say how many, quoting counts the "
+		"snippet returns per folder (never count a list yourself), offer the scopes that fit (the open "
+		"page's folder, everything with changes, let me pick), then publish what they choose. Tool "
+		"results don't carry into your next turn, so a card that lists pages keeps their ids in a note "
+		"(never on the card, ids mean nothing to the user) to map the reply back. Defaults to the open "
+		"page."
+	),
+	parameters={
+		"type": "object",
+		"properties": {
+			"pages": {
+				"type": "array",
+				"items": {"type": "string"},
+				"description": (
+					"Page ids to publish. A route, title or URL also resolves when no other page "
+					"shares it. Omit for the open page."
+				),
+			}
+		},
+		"required": [],
+	},
+	handler=publish_pages,
+)
+
 edit_global_settings_tool = Tool(
 	name="edit_global_settings",
 	side="terminal",
@@ -259,5 +363,6 @@ TOOLS = [
 	set_page_settings_tool,
 	set_design_token_tool,
 	set_home_page_tool,
+	publish_page_tool,
 	edit_global_settings_tool,
 ]
